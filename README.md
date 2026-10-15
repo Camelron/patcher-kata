@@ -4,22 +4,22 @@ Uses one temporary privileged `busybox:1.36.1` pod per node. The local runtime a
 tools RPMs are streamed through `kubectl exec` into the host filesystem, so no custom container
 image, registry, SSH access, or package download server is required.
 
-From the repository root, inspect the plan first:
+From this directory, inspect the plan first:
 
 ```bash
-bash notes/patcher/patch-kata.sh
+bash ./patch-kata.sh
 ```
 
 Install both RPMs, then build and deploy the matching UVM on every node in the current context:
 
 ```bash
-bash notes/patcher/patch-kata.sh --apply
+bash ./patch-kata.sh --apply
 ```
 
 For an explicit context or a subset of nodes:
 
 ```bash
-bash notes/patcher/patch-kata.sh --context kata-prerel-oct-3 \
+bash ./patch-kata.sh --context kata-prerel-oct-3 \
   --selector kubernetes.azure.com/agentpool=nodepool1 --apply
 ```
 
@@ -90,8 +90,8 @@ rewrite shim configuration. Existing Kata VMs are not updated.
 ## Tests
 
 ```bash
-bats notes/patcher/patch-kata.bats
-shellcheck --exclude=SC2250 notes/patcher/patch-kata.sh
+bats ./patch-kata.bats
+shellcheck --exclude=SC2250 ./patch-kata.sh
 ```
 
 Tests mock Kubernetes access and exercise the host transaction and UVM commands
