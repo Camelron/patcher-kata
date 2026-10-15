@@ -50,6 +50,7 @@ case "$1" in
                     [[ "${MOCK_FAIL:-}" != build ]]
                 else
                     cp "$MOCK_DIR/host.sh" "$MOCK_DIR/preflight.sh"
+                    [[ "${MOCK_FAIL:-}" != preflight ]]
                 fi
                 ;;
             *) exit 1 ;;
@@ -63,6 +64,35 @@ MOCK
 
 patcher() {
     bash "$PATCHER" --tools-rpm "$MOCK_DIR/tools.rpm" "$@"
+}
+
+host_preflight() {
+    bash -c '
+        command() {
+            if [[ "$1" == -v ]]; then
+                if [[ "$2" == tdnf && "${MOCK_MANAGER:-tdnf}" == dnf && ! -f "$MOCK_DIR/dependencies-installed" ]]; then
+                    return 1
+                fi
+                if [[ "$2" == make ]]; then
+                    [[ -f "$MOCK_DIR/dependencies-installed" ]]
+                    return
+                fi
+                return 0
+            fi
+            builtin command "$@"
+        }
+        rpm() { printf "%s\n" "$*" >> "$MOCK_DIR/preflight-rpm-calls"; }
+        uname() { printf "x86_64\n"; }
+        sudo() { [[ "$*" == "-n true" ]]; }
+        install_dependencies() {
+            printf "%s\n" "$*" >> "$MOCK_DIR/dependency-calls"
+            [[ "${MOCK_DEPENDENCY_FAIL:-}" != true ]] || return "${MOCK_DEPENDENCY_STATUS:-1}"
+            touch "$MOCK_DIR/dependencies-installed"
+        }
+        dnf() { install_dependencies dnf "$@"; }
+        tdnf() { install_dependencies tdnf "$@"; }
+        source "$MOCK_DIR/preflight.sh"
+    '
 }
 
 @test "default plan is read-only and pins the current context" {
@@ -84,28 +114,34 @@ patcher() {
     [ "$(grep -E 'create -f -|delete pod' "$MOCK_DIR/calls" | sed -n '2p' | grep -c 'delete pod')" -eq 1 ]
     jq -se 'length == 2 and all(.[]; .spec.containers[0].securityContext.privileged and
         (.spec.volumes[0].hostPath.path == "/") and (.spec.automountServiceAccountToken == false) and
+        (.spec.runtimeClassName == "runc") and
+        (.spec.containers[0].resources.requests.memory == "4Gi") and
+        (.spec.containers[0].resources.limits.memory == "4Gi") and
+        (.spec.containers[0].command == ["tail", "-f", "/dev/null"]) and
         (.spec.activeDeadlineSeconds == 7200))' "$MOCK_DIR/manifests"
     bash -n "$MOCK_DIR/preflight.sh" "$MOCK_DIR/install.sh" "$MOCK_DIR/build.sh"
     grep -q -- '--request-timeout=0 .*exec -i' "$MOCK_DIR/calls"
     [[ "$output" == *'deployed the UVM on all 2 selected node(s)'* ]]
 }
 
-@test "installation failure stops the rollout and cleans the pod" {
+@test "installation failure stops the rollout and retains the pod" {
     export MOCK_FAIL=install
     run patcher --apply --rpm "$MOCK_DIR/package.rpm"
     [ "$status" -ne 0 ]
     [ "$(grep -c 'create -f -' "$MOCK_DIR/calls")" -eq 1 ]
-    [ "$(grep -c 'delete pod' "$MOCK_DIR/calls")" -eq 1 ]
+    ! grep -q 'delete pod' "$MOCK_DIR/calls"
+    [[ "$output" == *'Retaining helper pod'* ]]
     [ ! -e "$MOCK_DIR/build.sh" ]
 }
 
-@test "readiness failure prints diagnostics and cleans the pod" {
+@test "readiness failure prints diagnostics and retains the pod" {
     export MOCK_FAIL=wait
     run patcher --apply --rpm "$MOCK_DIR/package.rpm"
     [ "$status" -ne 0 ]
     [[ "$output" == *'Mock pod diagnostics'* ]]
     ! grep -q 'exec -i' "$MOCK_DIR/calls"
-    grep -q 'delete pod' "$MOCK_DIR/calls"
+    ! grep -q 'delete pod' "$MOCK_DIR/calls"
+    [[ "$output" == *'Retaining helper pod'* ]]
 }
 
 @test "unsupported architecture fails before creating pods" {
@@ -174,12 +210,13 @@ RPM
     [ ! -d "$MOCK_DIR/staging" ]
 }
 
-@test "UVM failure stops the rollout and cleans the pod" {
+@test "UVM failure stops the rollout and retains the pod" {
     export MOCK_FAIL=build
     run patcher --apply --rpm "$MOCK_DIR/package.rpm"
     [ "$status" -ne 0 ]
     [ "$(grep -c 'create -f -' "$MOCK_DIR/calls")" -eq 1 ]
-    [ "$(grep -c 'delete pod' "$MOCK_DIR/calls")" -eq 1 ]
+    ! grep -q 'delete pod' "$MOCK_DIR/calls"
+    [[ "$output" == *'Retaining helper pod'* ]]
     [ -f "$MOCK_DIR/install.sh" ]
     [ -f "$MOCK_DIR/build.sh" ]
 }
@@ -209,4 +246,48 @@ MAKE
     '
     [ "$status" -ne 0 ]
     [ "$(cat "$MOCK_DIR/make-calls")" = uvm ]
+}
+
+@test "tdnf is preferred and installs the full dependency list before checking make" {
+    run patcher --apply --rpm "$MOCK_DIR/package.rpm"
+    [ "$status" -eq 0 ]
+    run host_preflight
+    [ "$status" -eq 0 ]
+    [ "$(cat "$MOCK_DIR/dependency-calls")" = 'tdnf -y --exclude kernel-uvm install git golang rust cargo build-essential protobuf-compiler protobuf-devel expect openssl-devel clang-devel libseccomp-devel btrfs-progs-devel device-mapper-devel cmake fuse-devel kata-packages-uvm-build make sudo gawk e2fsprogs' ]
+}
+
+@test "dependency provisioning falls back to dnf" {
+    run patcher --apply --rpm "$MOCK_DIR/package.rpm"
+    [ "$status" -eq 0 ]
+    export MOCK_MANAGER=dnf
+    run host_preflight
+    [ "$status" -eq 0 ]
+    grep -q '^dnf -y --exclude kernel-uvm install ' "$MOCK_DIR/dependency-calls"
+}
+
+@test "dependency installation failure fails preflight and rollout stops before upload" {
+    export MOCK_FAIL=preflight
+    run patcher --apply --rpm "$MOCK_DIR/package.rpm"
+    [ "$status" -ne 0 ]
+    [ "$(grep -c 'create -f -' "$MOCK_DIR/calls")" -eq 1 ]
+    ! grep -q 'delete pod' "$MOCK_DIR/calls"
+    [[ "$output" == *'Retaining helper pod'* ]]
+    [ ! -e "$MOCK_DIR/upload-kata.rpm" ]
+    [ ! -e "$MOCK_DIR/install.sh" ]
+    export MOCK_DEPENDENCY_FAIL=true
+    run host_preflight
+    [ "$status" -ne 0 ]
+    [ ! -e "$MOCK_DIR/dependencies-installed" ]
+}
+
+@test "SIGKILL during dependency installation preserves exit 137 and reports diagnostics" {
+    run patcher --apply --rpm "$MOCK_DIR/package.rpm"
+    [ "$status" -eq 0 ]
+    export MOCK_DEPENDENCY_FAIL=true
+    export MOCK_DEPENDENCY_STATUS=137
+    run host_preflight
+    [ "$status" -eq 137 ]
+    [[ "$output" == *'tdnf failed (exit 137)'* ]]
+    [[ "$output" == *'SIGKILL received'* ]]
+    [ ! -e "$MOCK_DIR/dependencies-installed" ]
 }

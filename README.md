@@ -59,12 +59,25 @@ rewrite shim configuration. Existing Kata VMs are not updated.
   image, or already have it cached; `--image` can select an approved mirror.
 - All selected nodes must be Linux amd64 with an existing Kata RPM installation
   and host `rpm`, `sha256sum`, and `mktemp`. These RPMs are built for Azure Linux 3.0.
-  The build also requires host Bash, `make`, `sudo` (noninteractive root access),
-  `tdnf`, `gawk`, and the node builder's image tools, including `e2fsprogs`.
+  Before checking build commands or installing either RPM, `--apply` provisions
+  host dependencies using Azure Linux's native `tdnf -y install` (or `dnf` if
+  `tdnf` is absent), as root:
+
+  ```bash
+  tdnf -y --exclude kernel-uvm install git golang rust cargo build-essential protobuf-compiler \
+    protobuf-devel expect openssl-devel clang-devel libseccomp-devel \
+    btrfs-progs-devel device-mapper-devel cmake fuse-devel kata-packages-uvm-build \
+    make sudo gawk e2fsprogs
+  ```
+
+  The host dependency transaction excludes `kernel-uvm` to preserve the installed
+  kernel package and avoid conflicts. This does not bypass dependency checks.
   The packaged build scripts invoke `sudo` internally even when running as root.
-  The patcher checks the main build commands before installing either RPM; it
-  does not provision build dependencies. Nodes need sufficient disk space and
-  repository access for `tdnf` to install guest packages into the rootfs.
+  The patcher then checks for Bash, `make`, `sudo` (noninteractive root access),
+  `tdnf`, and `gawk`. Nodes need sufficient disk space and repository access for
+  both host dependencies and guest rootfs packages. Dependency installation
+  failure stops the rollout before RPM upload; already-installed dependencies
+  are not rolled back. Plan-only runs do not install dependencies.
 - Verifies both uploaded SHA-256 checksums and RPM identities, runs
   `rpm -Uvh --test --replacepkgs`, installs with `rpm -Uvh --replacepkgs`, and
   verifies both installed versions. Both RPMs are passed to the same transaction.
@@ -76,8 +89,11 @@ rewrite shim configuration. Existing Kata VMs are not updated.
 - Processes nodes sequentially and stops at the first failure. Earlier successful
   installations are not rolled back. If a UVM build or deployment fails, the
   RPMs on that node have already been installed; no automatic rollback occurs.
-  Host staging files and helper pods are
-  removed on normal completion and handled failures. A lost connection or forced
+  Helpers use the `runc` RuntimeClass with a 4 GiB memory request and limit.
+  Helper pods are removed after success but retained on failure for diagnostics;
+  the script prints inspect, exec, and manual deletion commands. Host RPM staging
+  files are removed when their transaction exits normally or with a handled error.
+  A lost connection or forced
   process termination can leave staging files under `/var/tmp/kata-rpm-patcher.*`;
   a helper left behind exits after two hours but may need manual deletion.
   Exec calls allow long builds; the helper has a two-hour overall deadline.

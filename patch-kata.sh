@@ -36,6 +36,7 @@ Requires bash, kubectl, jq, tar, sha256sum, and permission to run privileged
 pods with a host-root mount. No custom image or registry is needed.
 Does not drain/reboot nodes, restart services, or update existing Kata VMs.
 Builds using the tools RPM's UVM targets; preserves shim configuration.
+Installs host build dependencies with tdnf (or dnf) before installing the RPMs.
 USAGE
 }
 
@@ -85,7 +86,14 @@ cleanup_pod() {
 cleanup() {
     local result=$?
     trap - EXIT
-    cleanup_pod || result=1
+    if [[ "$result" -ne 0 && -n "$pod" ]]; then
+        printf 'Retaining helper pod %s in namespace %s for diagnostics (exit %s).\n' "$pod" "$namespace" "$result" >&2
+        printf 'Inspect: kubectl --context %q -n %q describe pod %q\n' "$context" "$namespace" "$pod" >&2
+        printf 'Exec: kubectl --context %q -n %q exec -it %q -- sh\n' "$context" "$namespace" "$pod" >&2
+        printf 'Delete when finished: kubectl --context %q -n %q delete pod %q\n' "$context" "$namespace" "$pod" >&2
+    else
+        cleanup_pod || result=1
+    fi
     if [[ -n "$work_dir" ]]; then
         rm -rf -- "$work_dir"
     fi
@@ -128,6 +136,7 @@ printf 'Context: %s\nNamespace: %s\nRPM: %s\nSHA256: %s\nHelper image: %s\nNodes
 printf '  %s\n' "${nodes[@]}"
 printf 'Tools RPM: %s\nTools SHA256: %s\nUVM: build and deploy on each node (SHIM_REDEPLOY_CONFIG=no)\n' \
     "$tools_rpm_path" "$tools_checksum"
+printf 'Host dependencies: install build packages with tdnf (or dnf) before RPM installation\n'
 if [[ "$apply" != true ]]; then
     printf '\nPlan only. Re-run with --apply to install. No cluster changes made.\n'
     exit 0
@@ -141,11 +150,13 @@ for node in "${nodes[@]}"; do
         metadata: {name: $name, namespace: $namespace, labels: {app: "kata-rpm-patcher"}},
         spec: {
             nodeName: $node, restartPolicy: "Never", activeDeadlineSeconds: 7200,
+            runtimeClassName: "runc",
             terminationGracePeriodSeconds: 1, automountServiceAccountToken: false,
             tolerations: [{operator: "Exists"}],
             containers: [{name: "patcher", image: $image, imagePullPolicy: "IfNotPresent",
-                command: ["sh", "-c", "sleep 7200"],
+                command: ["tail", "-f", "/dev/null"],
                 securityContext: {privileged: true, runAsUser: 0},
+                resources: {requests: {memory: "4Gi"}, limits: {memory: "4Gi"}},
                 volumeMounts: [{name: "host", mountPath: "/host"}]}],
             volumes: [{name: "host", hostPath: {path: "/", type: "Directory"}}]
         }
@@ -159,12 +170,35 @@ for node in "${nodes[@]}"; do
 set -eu
 command -v rpm >/dev/null
 command -v sha256sum >/dev/null
+test "$(uname -m)" = x86_64
+rpm -q kata-containers
+if command -v tdnf >/dev/null; then
+    package_manager=tdnf
+elif command -v dnf >/dev/null; then
+    package_manager=dnf
+else
+    echo 'Missing host package manager: dnf or tdnf required' >&2
+    exit 1
+fi
+printf 'Installing host build dependencies with %s...\n' "$package_manager"
+if "$package_manager" -y --exclude kernel-uvm install \
+    git golang rust cargo build-essential protobuf-compiler protobuf-devel \
+    expect openssl-devel clang-devel libseccomp-devel btrfs-progs-devel \
+    device-mapper-devel cmake fuse-devel kata-packages-uvm-build \
+    make sudo gawk e2fsprogs; then
+    printf 'Host build dependencies installed.\n'
+else
+    result=$?
+    printf 'Host dependency installation with %s failed (exit %s).\n' "$package_manager" "$result" >&2
+    if test "$result" -eq 137; then
+        printf 'SIGKILL received; check node kernel/security logs and helper cgroup limits.\n' >&2
+    fi
+    exit "$result"
+fi
 for dependency in bash make sudo tdnf gawk; do
     command -v "$dependency" >/dev/null || { echo "Missing host build command: $dependency" >&2; exit 1; }
 done
 sudo -n true
-test "$(uname -m)" = x86_64
-rpm -q kata-containers
 PREFLIGHT
     host_dir=$("${exec_pod[@]}" chroot /host mktemp -d /var/tmp/kata-rpm-patcher.XXXXXX)
     [[ "$host_dir" =~ ^/var/tmp/kata-rpm-patcher\.[[:alnum:]]+$ ]] || die 'Unexpected host staging directory'
